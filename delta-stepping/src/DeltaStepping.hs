@@ -62,19 +62,22 @@ type Distance = Float -- Distances between nodes are (positive) floating point v
 -- NOTE: The type of the 'deltaStepping' function should not change (since that
 -- is what the test suite expects), but you are free to change the types of all
 -- other functions and data structures in this module as you require.
-deltaStepping ::
-  Bool -> -- Whether to print intermediate states to the console, for debugging purposes
-  Graph -> -- graph to analyse
-  Distance -> -- delta (step width, bucket width)
-  Node -> -- index of the starting node
-  IO (Vector Distance)
+deltaStepping 
+  :: Bool  -- Whether to print intermediate states to the console, for debugging purposes
+  -> Graph  -- graph to analyse
+  -> Distance  -- delta (step width, bucket width)
+  -> Node  -- index of the starting node
+  -> IO (Vector Distance)
 deltaStepping verbose graph delta source = do
-  threadCount <- getNumCapabilities
+  threadCount <- getNumCapabilities -- the number of (kernel) threads to use: the 'x' in '+RTS -Nx'
 
+  -- Initialise the algorithm
   (buckets, distances) <- initialise graph delta source
   printVerbose verbose "initialse" graph delta buckets distances
 
-  let loop = do
+  let 
+    -- The algorithm loops while there are still non-empty buckets
+    loop = do
         done <- allBucketsEmpty buckets
         if done
           then return ()
@@ -89,6 +92,11 @@ deltaStepping verbose graph delta source = do
 
 -- Initialise algorithm state
 --
+initialise 
+  :: Graph
+  -> Distance
+  -> Node
+  -> IO (Buckets, TentativeDistances)
 initialise graph delta source = do
   let nodes = G.nodes graph
       maxNode = if null nodes then 0 else maximum nodes
@@ -180,10 +188,10 @@ splitWork :: Int -> Int -> [a] -> [[a]]
 splitWork numChunks totalSize xs = go xs numChunks totalSize
   where
     go _ 0 _ = []
-    go ys k remaining =
-      let chunkSize = (remaining + k - 1) `div` k
+    go ys k remainder =
+      let chunkSize = (remainder + k - 1) `div` k
           (chunk, rest) = splitAt chunkSize ys
-       in chunk : go rest (k - 1) (remaining - chunkSize)
+       in chunk : go rest (k - 1) (remainder - chunkSize)
 
 minWorkThreshold :: Int
 minWorkThreshold = 500
@@ -193,28 +201,28 @@ mergeTree = foldl' (Map.unionWith min) Map.empty
 
 -- Create requests of (node, distance) pairs that fulfil the given predicate
 --
-findRequests ::
-  Int ->
-  (Distance -> Bool) ->
-  Graph ->
-  IntSet ->
-  TentativeDistances ->
-  IO (IntMap Distance)
-findRequests threadCount predicate graph nodes distances = do
-  let nodeList = Set.toList nodes
-      workSize = Set.size nodes
+findRequests 
+  :: Int 
+  -> (Distance -> Bool) 
+  -> Graph 
+  -> IntSet 
+  -> TentativeDistances 
+  -> IO (IntMap Distance)
+findRequests threadCount p graph v' distances = do
+  let nodeList = Set.toList v'
+      workSize = Set.size v'
       useParallel = threadCount > 1 && workSize > minWorkThreshold
 
   if not useParallel
-    then findRequestsSeq nodeList
-    else findRequestsPar nodeList workSize threadCount
+    then findReqInSequence nodeList
+    else findReqInParallel nodeList workSize threadCount
   where
-    findRequestsSeq ns = do
+    findReqInSequence ns = do
       currentDists <- mapM (S.read distances) ns
       let requests = concat $ zipWith generateEdges ns currentDists
       return $ Map.fromListWith min requests
 
-    findRequestsPar ns totalWork tc = do
+    findReqInParallel ns totalWork tc = do
       resultVars <- Vec.replicateM tc newEmptyMVar
       let !chunks = Vec.fromList $ splitWork tc totalWork ns
 
@@ -232,21 +240,21 @@ findRequests threadCount predicate graph nodes distances = do
     generateEdges u distU =
       [ (v, distU + w)
         | (_, v, w) <- G.out graph u,
-          predicate w
+          p w
       ]
 
 -- Execute requests for each of the given (node, distance) pairs
 --
-relaxRequests ::
-  Int ->
-  Buckets ->
-  TentativeDistances ->
-  Distance ->
-  IntMap Distance ->
-  IO ()
-relaxRequests threadCount buckets distances delta reqs = do
-  let reqList = Map.toList reqs
-      workSize = Map.size reqs
+relaxRequests 
+  :: Int
+  -> Buckets
+  -> TentativeDistances
+  -> Distance
+  -> IntMap Distance
+  -> IO ()
+relaxRequests threadCount buckets distances delta req = do
+  let reqList = Map.toList req
+      workSize = Map.size req
       useParallel = threadCount > 1 && workSize > minWorkThreshold
 
   if not useParallel
@@ -255,26 +263,25 @@ relaxRequests threadCount buckets distances delta reqs = do
       let !chunks = Vec.fromList $ splitWork threadCount workSize reqList
 
       forkThreads threadCount $ \tid -> do
-        let !myReqs = chunks Vec.! tid
-        mapM_ (relax buckets distances delta) myReqs
+        let !myReq = chunks Vec.! tid
+        mapM_ (relax buckets distances delta) myReq
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
 -- as necessary
 --
-relax ::
-  Buckets ->
-  TentativeDistances ->
-  Distance ->
-  (Node, Distance) -> -- (w, x) in the paper
+relax :: Buckets
+  -> TentativeDistances
+  -> Distance
+  -> (Node, Distance) -> -- (w, x) in the paper
   IO ()
 relax Buckets {..} distances delta (node, newDistance) = do
   currentDist <- S.read distances node
 
   when (newDistance < currentDist) $ do
-    previousDistance <- atomicModifyIOVectorFloat distances node $ \oldDist ->
-      if newDistance < oldDist
-        then (newDistance, oldDist)
-        else (oldDist, oldDist)
+    previousDistance <- atomicModifyIOVectorFloat distances node $ \oldDistance ->
+      if newDistance < oldDistance
+        then (newDistance, oldDistance)
+        else (oldDistance, oldDistance)
 
     when (newDistance < previousDistance) $ do
       let len = V.length bucketArray
@@ -299,14 +306,14 @@ relax Buckets {..} distances delta (node, newDistance) = do
 type TentativeDistances = S.IOVector Distance
 
 data Buckets = Buckets
-  { firstBucket :: {-# UNPACK #-} !(IORef Int), -- real index of the first bucket (j)
-    bucketArray :: {-# UNPACK #-} !(V.IOVector IntSet) -- cyclic array of buckets
+  { firstBucket :: {-# UNPACK #-} !(IORef Int) -- real index of the first bucket (j)
+    , bucketArray :: {-# UNPACK #-} !(V.IOVector IntSet) -- cyclic array of buckets
   }
 
 -- The initial tentative distance, or the distance to unreachable nodes
 --
 infinity :: Distance
-infinity = 1 / 0
+infinity = 1/0
 
 -- Forks 'n' threads. Waits until those threads have finished. Each thread
 -- runs the supplied function given its thread ID in the range [0..n).
