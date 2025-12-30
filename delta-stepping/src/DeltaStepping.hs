@@ -88,6 +88,14 @@ deltaStepping verbose graph delta source = do
   loop
 
   printVerbose verbose "result" graph delta buckets distances
+  -- Once the tentative distances are finalised, convert into an immutable array
+  -- to prevent further updates. It is safe to use this "unsafe" function here
+  -- because the mutable vector will not be used any more, so referential
+  -- transparency is preserved for the frozen immutable vector.
+  --
+  -- NOTE: The function 'Data.Vector.convert' can be used to translate between
+  -- different (compatible) vector types (e.g. boxed to storable)
+  --
   S.unsafeFreeze distances
 
 -- Initialise algorithm state
@@ -98,18 +106,23 @@ initialise
   -> Node
   -> IO (Buckets, TentativeDistances)
 initialise graph delta source = do
+
+  -- See the number of nodes in the graph, if the graph is empty default to 0
   let nodes = G.nodes graph
       maxNode = if null nodes then 0 else maximum nodes
       nodeCount = maxNode + 1
 
+  -- Initialise tentative distances to infinity 
   distances <- S.replicate nodeCount infinity
   S.write distances source 0
 
+  -- Create fixed amount of buckets
   let numBuckets = 128
   bucketArray <- V.replicate numBuckets Set.empty
 
   V.write bucketArray 0 (Set.singleton source)
 
+  -- The index of the first bucket 
   firstBucket <- newIORef 0
 
   return (Buckets firstBucket bucketArray, distances)
@@ -117,55 +130,70 @@ initialise graph delta source = do
 -- Take a single step of the algorithm.
 -- That is, one iteration of the outer while loop.
 --
-step ::
-  Bool ->
-  Int ->
-  Graph ->
-  Distance ->
-  Buckets ->
-  TentativeDistances ->
-  IO ()
-step verbose threadCount graph delta buckets@Buckets {..} distances = do
-  i <- findNextBucket buckets
-  writeIORef firstBucket i
+step 
+  :: Bool
+  -> Int
+  -> Graph
+  -> Distance
+  -> Buckets
+  -> TentativeDistances
+  -> IO ()
+step verbose threadCount graph delta buckets distances = do
 
+  -- find the next non-empty bucket
+  i <- findNextBucket buckets
+  writeIORef (firstBucket buckets) i
+
+  let arr = bucketArray buckets
+      len = V.length arr
+
+  -- process all light edges in the current bucket
   let processLightEdges removedNodes = do
-        let idx = i `rem` V.length bucketArray
-        nodes <- V.read bucketArray idx
+        let idx = i `rem` len
+        nodes <- V.read arr idx
 
         if Set.null nodes
           then return removedNodes
           else do
-            V.write bucketArray idx Set.empty
+
+            -- empty the current bucket
+            V.write arr idx Set.empty
 
             printVerbose verbose "inner step" graph delta buckets distances
 
+            -- find requests for light edges
             reqs <- findRequests threadCount (\w -> w <= delta) graph nodes distances
 
+            -- apply the relaxations and update buckets/distances
             relaxRequests threadCount buckets distances delta reqs
 
+            -- continue processing light edges
             processLightEdges (Set.union removedNodes nodes)
 
   nodesProcessed <- processLightEdges Set.empty
 
+  -- process heavy edges from nodes processed in this bucket
   unless (Set.null nodesProcessed) $ do
     reqs <- findRequests threadCount (\w -> w > delta) graph nodesProcessed distances
     relaxRequests threadCount buckets distances delta reqs
 
-  writeIORef firstBucket (i + 1)
+  -- move to the next bucket
+  writeIORef (firstBucket buckets) (i + 1)
 
 -- Once all buckets are empty, the tentative distances are finalised and the
 -- algorithm terminates.
 --
 allBucketsEmpty :: Buckets -> IO Bool
-allBucketsEmpty Buckets {..} = check 0
+allBucketsEmpty buckets = do
+  check 0
   where
-    len = V.length bucketArray
+    arr = bucketArray buckets
+    len = V.length arr
     check i
       | i >= len = return True
       | otherwise = do
-          bucket <- V.read bucketArray i
-          if Set.null bucket
+          b <- V.read arr i
+          if Set.null b
             then check (i + 1)
             else return False
 
@@ -173,17 +201,22 @@ allBucketsEmpty Buckets {..} = check 0
 -- least one non-empty bucket remaining.
 --
 findNextBucket :: Buckets -> IO Int
-findNextBucket Buckets {..} = do
-  start <- readIORef firstBucket
-  let len = V.length bucketArray
+findNextBucket buckets = do
+  start <- readIORef (firstBucket buckets)
+  let arr = bucketArray buckets
+      len = V.length arr
       go i = do
         let idx = i `rem` len
-        b <- V.read bucketArray idx
+        b <- V.read arr idx
         if Set.null b
           then go (i + 1)
           else return i
   go start
 
+-- Split work into chunks for parallel processing
+--  
+-- used to divide a list of size totalSize into numChunks sublists
+--
 splitWork :: Int -> Int -> [a] -> [[a]]
 splitWork numChunks totalSize xs = go xs numChunks totalSize
   where
@@ -193,9 +226,13 @@ splitWork numChunks totalSize xs = go xs numChunks totalSize
           (chunk, rest) = splitAt chunkSize ys
        in chunk : go rest (k - 1) (remainder - chunkSize)
 
+-- Minimum amount of work to do in parallel
+-- 
 minWorkThreshold :: Int
 minWorkThreshold = 500
 
+-- Merge multiple IntMaps into a single IntMap taking the minimum value for
+-- 
 mergeTree :: [IntMap Distance] -> IntMap Distance
 mergeTree = foldl' (Map.unionWith min) Map.empty
 
@@ -217,11 +254,14 @@ findRequests threadCount p graph v' distances = do
     then findReqInSequence nodeList
     else findReqInParallel nodeList workSize threadCount
   where
+
+    -- sequential version
     findReqInSequence ns = do
       currentDists <- mapM (S.read distances) ns
       let requests = concat $ zipWith generateEdges ns currentDists
       return $ Map.fromListWith min requests
 
+    -- parallel version
     findReqInParallel ns totalWork tc = do
       resultVars <- Vec.replicateM tc newEmptyMVar
       let !chunks = Vec.fromList $ splitWork tc totalWork ns
@@ -237,6 +277,7 @@ findRequests threadCount p graph v' distances = do
 
       return $! mergeTree maps
 
+    -- generate edges for a single node u with distance distU
     generateEdges u distU =
       [ (v, distU + w)
         | (_, v, w) <- G.out graph u,
@@ -270,29 +311,33 @@ relaxRequests threadCount buckets distances delta req = do
 -- as necessary
 --
 relax :: Buckets
-  -> TentativeDistances
-  -> Distance
-  -> (Node, Distance) -> -- (w, x) in the paper
-  IO ()
-relax Buckets {..} distances delta (node, newDistance) = do
+      -> TentativeDistances
+      -> Distance
+      -> (Node, Distance)  -- (w, x) in the paper
+      -> IO ()
+relax buckets distances delta (node, newDistance) = do
   currentDist <- S.read distances node
 
   when (newDistance < currentDist) $ do
+    -- update tentative distance atomically
     previousDistance <- atomicModifyIOVectorFloat distances node $ \oldDistance ->
       if newDistance < oldDistance
         then (newDistance, oldDistance)
         else (oldDistance, oldDistance)
 
     when (newDistance < previousDistance) $ do
-      let len = V.length bucketArray
+      let arr = bucketArray buckets
+          len = V.length arr
 
+      -- remove from old bucket if necessary
       unless (isInfinite previousDistance) $ do
         let oldBucketIdx = floor (previousDistance / delta) `rem` len
-        _ <- atomicModifyIOVector bucketArray oldBucketIdx $ \s -> (Set.delete node s, ())
+        _ <- atomicModifyIOVector arr oldBucketIdx $ \s -> (Set.delete node s, ())
         return ()
 
+      -- add node to new bucket
       let newBucketIdx = floor (newDistance / delta) `rem` len
-      _ <- atomicModifyIOVector bucketArray newBucketIdx $ \s -> (Set.insert node s, ())
+      _ <- atomicModifyIOVector arr newBucketIdx $ \s -> (Set.insert node s, ())
       return ()
 
 -- -----------------------------------------------------------------------------
