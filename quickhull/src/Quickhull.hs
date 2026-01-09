@@ -1,4 +1,5 @@
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RebindableSyntax #-}
@@ -167,7 +168,10 @@ shiftHeadFlagsR arr = backpermute sh getIndex arr
 -- non-associative combination functions may seem to work fine here -- only to
 -- fail spectacularly when testing with a parallel backend on larger inputs. ;)
 segmentedScanl1 :: (Elt a) => (Exp a -> Exp a -> Exp a) -> Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
-segmentedScanl1 = error "TODO: segmentedScanl1"
+segmentedScanl1 f flags values =
+  let pairs = zip flags values
+      (_, result) = unzip (scanl1 (segmented f) pairs)
+   in result
 
 -- >>> import Data.Array.Accelerate.Interpreter
 -- >>> let flags  = fromList (Z :. 9) [True,False,False,True,True,False,False,False,True]
@@ -178,7 +182,11 @@ segmentedScanl1 = error "TODO: segmentedScanl1"
 -- >>> fromList (Z :. 9) [1, 2+3+4, 3+4, 4, 5, 6+7+8+9, 7+8+9, 8+9, 9] :: Vector Int
 -- Vector (Z :. 9) [1,9,7,4,5,30,24,17,9]
 segmentedScanr1 :: (Elt a) => (Exp a -> Exp a -> Exp a) -> Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
-segmentedScanr1 = error "TODO: segmentedScanr1"
+segmentedScanr1 f flags values =
+  let pairs = zip flags values
+      segR (T2 aF aV) (T2 bF bV) = T2 aF (if bF then aV else f aV bV)
+      (_, result) = unzip (scanr1 segR pairs)
+   in result
 
 -- Given utility functions
 -- -----------------------
