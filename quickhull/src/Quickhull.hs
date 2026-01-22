@@ -56,6 +56,7 @@ type SegmentedPoints = (Vector Bool, Vector Point)
 --
 initialPartition :: Acc (Vector Point) -> Acc SegmentedPoints
 initialPartition points =
+  --Locate left-most and right-most points
   let p1, p2 :: Exp Point
       p1 =
         the
@@ -67,7 +68,6 @@ initialPartition points =
               )
               points
           )
-
       p2 =
         the
           ( fold1
@@ -79,15 +79,18 @@ initialPartition points =
               points
           )
 
+      -- lines used to classify points
       line1 = T2 p1 p2
       line2 = T2 p2 p1
 
+      -- Determine which points lie above and below the line (p1,p2)
       isUpper :: Acc (Vector Bool)
       isUpper = map (\p -> pointIsLeftOfLine line1 p && not (pointEq p p1) && not (pointEq p p2)) points
 
       isLower :: Acc (Vector Bool)
       isLower = map (\p -> pointIsLeftOfLine line2 p && not (pointEq p p1) && not (pointEq p p2)) points
 
+      -- compute number of points above and below the line and their relative indexes.
       offsetUpper :: Acc (Vector Int)
       countUpper :: Acc (Scalar Int)
       T2 offsetUpper countUpper = scanl' (+) 0 (map boolToInt isUpper)
@@ -100,6 +103,7 @@ initialPartition points =
       theCountLower = the countLower
       theSz = 3 + theCountUpper + theCountLower
 
+      -- Compute the index in the result array for each point, where present.
       destination :: Acc (Vector (Maybe DIM1))
       destination =
         generate
@@ -122,10 +126,11 @@ initialPartition points =
                                 else lift (Nothing :: Maybe DIM1)
           )
 
+      -- reorder points according to the computed destinations
       newPoints :: Acc (Vector Point)
       newPoints = permute const (fill (index1 theSz) p1) (destination !) points
 
-      -- ensure the closing point is flagged.
+      -- create head flags array demarcating the initial segments
       headFlags :: Acc (Vector Bool)
       headFlags =
         generate
@@ -153,9 +158,11 @@ pointEq a b =
 --
 partition :: Acc SegmentedPoints -> Acc SegmentedPoints
 partition (T2 flags points) =
+  -- Propagate segment endpoints to all points in their segments
   let p1_for_each = propagateL flags points
       p2_for_each = propagateR flags points
 
+      -- distance from each point to its segment line
       distances =
         zipWith3
           (\p1 p2 p -> abs (nonNormalizedDistance (T2 p1 p2) p))
@@ -163,8 +170,7 @@ partition (T2 flags points) =
           p2_for_each
           points
 
-      -- Use projection onto the segment p1->p2 as a tie-breaker.
-      -- maximize the projection (furthest along p1->p2).
+      -- projection onto the line from p1 to p2
       projections =
         zipWith3
           ( \p1 p2 p ->
@@ -185,6 +191,7 @@ partition (T2 flags points) =
       -- Combine distance, projection score, and index
       dist_score_index = zipWith3 (\d s i -> T2 d (T2 s i)) distances projections indices
 
+      -- Segment-wise argmax to find p3 for every segment
       argmax_scan =
         segmentedScanl1
           ( \v1 v2 ->
@@ -199,10 +206,12 @@ partition (T2 flags points) =
       p3_indices = map (\v -> let T2 _ (T2 _ i) = v in i) argmax_per_segment
       p3s = map (\i -> points ! index1 i) p3_indices
 
+      -- Classify points while looking at the lines (p1,p3) and (p3,p2)
       is_undecided = map not flags
       is_left_p1p3 = zipWith3 (\p1 p3 p -> pointIsLeftOfLine (T2 p1 p3) p) p1_for_each p3s points
       is_left_p3p2 = zipWith3 (\p3 p2 p -> pointIsLeftOfLine (T2 p3 p2) p) p3s p2_for_each points
 
+      -- masks for new subsegments
       mask1 =
         zipWith3
           (\u l1 l2 -> if u && l1 && not l2 then 1 else 0 :: Exp Int)
@@ -216,6 +225,7 @@ partition (T2 flags points) =
           is_left_p1p3
           is_left_p3p2
 
+      -- calculate offsets for each subsegment
       res_scan1 = scanl' (+) 0 mask1
       res_scan2 = scanl' (+) 0 mask2
       (offset1, _) = unlift res_scan1 :: (Acc (Vector Int), Acc (Scalar Int))
@@ -224,6 +234,7 @@ partition (T2 flags points) =
       local_off1 = segmentedScanl1 (+) flags mask1
       local_off2 = segmentedScanl1 (+) flags mask2
 
+      -- Calculate sizes of new segments
       count1_per_seg = propagateR (shiftHeadFlagsL flags) local_off1
       count2_per_seg = propagateR (shiftHeadFlagsL flags) local_off2
 
@@ -241,6 +252,7 @@ partition (T2 flags points) =
       the_total_sz = the total_sum_scalar
       starts = propagateL flags global_offsets
 
+      -- map each point to its new location
       destination =
         zipWith7
           ( \f m1 m2 s lo1 lo2 c1 ->
@@ -269,6 +281,7 @@ partition (T2 flags points) =
       blankPoints = fill (index1 the_total_sz) (T2 0 0)
       newPoints = permute const blankPoints (destination !) points
 
+      -- determine where to place p3 points
       p3_dest =
         zipWith4
           ( \f s c1 p3i ->
@@ -284,6 +297,7 @@ partition (T2 flags points) =
 
       newPointsWithP3 = permute const newPoints (p3_dest !) p3s
 
+      -- create new head flags array
       flagsP1 =
         permute
           const
@@ -295,6 +309,7 @@ partition (T2 flags points) =
           )
           (fill (shape flags) (constant True))
 
+      -- place flags for p3 points
       finalFlags =
         permute
           const
@@ -316,7 +331,8 @@ partition (T2 flags points) =
 quickhull :: Acc (Vector Point) -> Acc (Vector Point)
 quickhull points =
   let initParts = initialPartition points
-
+  
+      -- Check that partitioning should continue while there are undecided points
       check :: Acc SegmentedPoints -> Acc (Scalar Bool)
       check (T2 flags _) = map not (Data.Array.Accelerate.and flags)
 
@@ -326,7 +342,7 @@ quickhull points =
       (T2 _ finalPoints) = finalState
 
       len = Data.Array.Accelerate.length finalPoints
-   in -- Remove the duplicate point (p1) added at the end
+   in 
       Data.Array.Accelerate.take (len - 1) finalPoints
 
 -- Helper functions
