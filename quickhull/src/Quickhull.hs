@@ -354,7 +354,7 @@ propagateL flags values = segmentedScanl1 const flags values
 -- should be:
 -- Vector (Z :. 9) [1,4,4,4,5,9,9,9,9]
 propagateR :: (Elt a) => Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
-propagateR flags values = reverse (segmentedScanl1 const (reverse flags) (reverse values))
+propagateR flags values = segmentedScanr1 (flip const) flags values
 
 -- >>> import Data.Array.Accelerate.Interpreter
 -- >>> run $ shiftHeadFlagsL (use (fromList (Z :. 6) [False,False,False,True,False,True]))
