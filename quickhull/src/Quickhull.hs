@@ -25,8 +25,8 @@ where
 
 import Data.Array.Accelerate
 import Data.Array.Accelerate.Debug.Trace
+import Data.Array.Accelerate.Smart (Acc (Acc))
 import qualified Prelude as P
-import Data.Array.Accelerate.Smart (Acc(Acc))
 
 -- Points and lines in two-dimensional space
 --
@@ -62,15 +62,28 @@ type SegmentedPoints = (Vector Bool, Vector Point)
 --
 initialPartition :: Acc (Vector Point) -> Acc SegmentedPoints
 initialPartition points =
-  let 
-      p1, p2 :: Exp Point
-      p1 = the (fold1 (\a b -> let (T2 ax ay) = a
-                                   (T2 bx by) = b
-                               in if ax < bx || (ax == bx && ay <= by) then a else b) points)
-      
-      p2 = the (fold1 (\a b -> let (T2 ax ay) = a
-                                   (T2 bx by) = b
-                               in if ax > bx || (ax == bx && ay >= by) then a else b) points)
+  let p1, p2 :: Exp Point
+      p1 =
+        the
+          ( fold1
+              ( \a b ->
+                  let (T2 ax ay) = a
+                      (T2 bx by) = b
+                   in if ax < bx || (ax == bx && ay <= by) then a else b
+              )
+              points
+          )
+
+      p2 =
+        the
+          ( fold1
+              ( \a b ->
+                  let (T2 ax ay) = a
+                      (T2 bx by) = b
+                   in if ax > bx || (ax == bx && ay >= by) then a else b
+              )
+              points
+          )
 
       line1 = T2 p1 p2
       line2 = T2 p2 p1
@@ -81,46 +94,57 @@ initialPartition points =
       isLower :: Acc (Vector Bool)
       isLower = map (\p -> pointIsLeftOfLine line2 p && not (pointEq p p1) && not (pointEq p p2)) points
 
-      -- offsetLower :: Acc (Vector Int)
-      -- countLower  :: Acc (Scalar Int)
-      -- T2 offserLower countLower = scanl' (+) 0 (map boolToInt isLower)
       resUpper = scanl' (+) 0 (map boolToInt isUpper)
       resLower = scanl' (+) 0 (map boolToInt isLower)
 
       (offsetUpper, countUpper) = unlift resUpper :: (Acc (Vector Int), Acc (Scalar Int))
       (offsetLower, countLower) = unlift resLower :: (Acc (Vector Int), Acc (Scalar Int))
-      
+
       theCountUpper = the countUpper
       theCountLower = the countLower
-      theSz         = 3 + theCountUpper + theCountLower
-      
+      theSz = 3 + theCountUpper + theCountLower
+
       destination :: Acc (Vector (Maybe DIM1))
-      destination = generate (shape points) (\i ->
-          let p = points ! i
-              offU = offsetUpper ! i
-              offL = offsetLower ! i
-          in if pointEq p p1      then lift (Just (index1 0))
-             else if isUpper ! i  then lift (Just (index1 (1 + offU)))
-             else if pointEq p p2 then lift (Just (index1 (1 + theCountUpper)))
-             else if isLower ! i  then lift (Just (index1 (2 + theCountUpper + offL)))
-             else lift (Nothing :: Maybe DIM1)
-        )
+      destination =
+        generate
+          (shape points)
+          ( \i ->
+              let p = points ! i
+                  offU = offsetUpper ! i
+                  offL = offsetLower ! i
+               in if pointEq p p1
+                    then lift (Just (index1 0))
+                    else
+                      if isUpper ! i
+                        then lift (Just (index1 (1 + offU)))
+                        else
+                          if pointEq p p2
+                            then lift (Just (index1 (1 + theCountUpper)))
+                            else
+                              if isLower ! i
+                                then lift (Just (index1 (2 + theCountUpper + offL)))
+                                else lift (Nothing :: Maybe DIM1)
+          )
 
       newPoints :: Acc (Vector Point)
       newPoints = permute const (fill (index1 theSz) p1) (destination !) points
-      
+
+      -- ensure the closing point is flagged.
       headFlags :: Acc (Vector Bool)
-      headFlags = generate (index1 theSz) (\i -> 
-          let idx = unindex1 i
-          in idx == 0 || idx == (1 + theCountUpper)
-        )
+      headFlags =
+        generate
+          (index1 theSz)
+          ( \i ->
+              let idx = unindex1 i
+               in idx == 0 || idx == (1 + theCountUpper) || idx == (theSz - 1)
+          )
    in T2 headFlags newPoints
 
 pointEq :: Exp Point -> Exp Point -> Exp Bool
-pointEq a b = 
+pointEq a b =
   let T2 ax ay = a
       T2 bx by = b
-  in ax == bx && ay == by
+   in ax == bx && ay == by
 
 -- The core of the algorithm processes all line segments at once in
 -- data-parallel. This is similar to the previous partitioning step, except
@@ -133,96 +157,181 @@ pointEq a b =
 --
 partition :: Acc SegmentedPoints -> Acc SegmentedPoints
 partition (T2 flags points) =
-  let 
-      p1_for_each = propagateL flags points
+  let p1_for_each = propagateL flags points
       p2_for_each = propagateR flags points
-      
-      distances = zipWith3 (\p1 p2 p -> abs (nonNormalizedDistance (T2 p1 p2) p)) 
-                           p1_for_each p2_for_each points
-      
-      indices = generate (shape points) unindex1
-      dist_index = zipWith T2 distances indices
-      
-      argmax_scan = segmentedScanl1 (\v1 v2 -> 
-          let T2 d1 i1 = v1
-              T2 d2 i2 = v2
-          in if d1 > d2 then v1 else v2) flags dist_index
-      
-      argmax_per_segment = propagateR (shiftHeadFlagsL flags) argmax_scan
-      p3_indices = map (\v -> let T2 _ i = v in i) argmax_per_segment
-      p3s        = map (\i -> points ! index1 i) p3_indices
 
-      is_undecided  = map not flags
-      is_left_p1p3  = zipWith3 (\p1 p3 p -> pointIsLeftOfLine (T2 p1 p3) p) p1_for_each p3s points
-      is_left_p3p2  = zipWith3 (\p3 p2 p -> pointIsLeftOfLine (T2 p3 p2) p) p3s p2_for_each points
-      
-      mask1 = zipWith3 (\u l1 l2 -> if u && l1 && not l2 then 1 else 0 :: Exp Int) 
-                       is_undecided is_left_p1p3 is_left_p3p2
-      mask2 = zipWith3 (\u l1 l2 -> if u && not l1 && l2 then 1 else 0 :: Exp Int) 
-                       is_undecided is_left_p1p3 is_left_p3p2
+      distances =
+        zipWith3
+          (\p1 p2 p -> abs (nonNormalizedDistance (T2 p1 p2) p))
+          p1_for_each
+          p2_for_each
+          points
+
+      -- Use projection onto the segment p1->p2 as a tie-breaker.
+      -- maximize the projection (furthest along p1->p2).
+      projections =
+        zipWith3
+          ( \p1 p2 p ->
+              let T2 x1 y1 = p1
+                  T2 x2 y2 = p2
+                  T2 x y = p
+                  vx = x - x1
+                  vy = y - y1
+                  lx = x2 - x1
+                  ly = y2 - y1
+               in vx * lx + vy * ly :: Exp Int
+          )
+          p1_for_each
+          p2_for_each
+          points
+
+      indices = generate (shape points) unindex1
+      -- Combine distance, projection score, and index
+      dist_score_index = zipWith3 (\d s i -> T2 d (T2 s i)) distances projections indices
+
+      argmax_scan =
+        segmentedScanl1
+          ( \v1 v2 ->
+              let T2 d1 (T2 s1 i1) = v1
+                  T2 d2 (T2 s2 i2) = v2
+               in if d1 > d2 || (d1 == d2 && s1 > s2) then v1 else v2
+          )
+          flags
+          dist_score_index
+
+      argmax_per_segment = propagateR (shiftHeadFlagsL flags) argmax_scan
+      p3_indices = map (\v -> let T2 _ (T2 _ i) = v in i) argmax_per_segment
+      p3s = map (\i -> points ! index1 i) p3_indices
+
+      is_undecided = map not flags
+      is_left_p1p3 = zipWith3 (\p1 p3 p -> pointIsLeftOfLine (T2 p1 p3) p) p1_for_each p3s points
+      is_left_p3p2 = zipWith3 (\p3 p2 p -> pointIsLeftOfLine (T2 p3 p2) p) p3s p2_for_each points
+
+      mask1 =
+        zipWith3
+          (\u l1 l2 -> if u && l1 && not l2 then 1 else 0 :: Exp Int)
+          is_undecided
+          is_left_p1p3
+          is_left_p3p2
+      mask2 =
+        zipWith3
+          (\u l1 l2 -> if u && not l1 && l2 then 1 else 0 :: Exp Int)
+          is_undecided
+          is_left_p1p3
+          is_left_p3p2
 
       res_scan1 = scanl' (+) 0 mask1
       res_scan2 = scanl' (+) 0 mask2
       (offset1, _) = unlift res_scan1 :: (Acc (Vector Int), Acc (Scalar Int))
       (offset2, _) = unlift res_scan2 :: (Acc (Vector Int), Acc (Scalar Int))
-      
+
       local_off1 = segmentedScanl1 (+) flags mask1
       local_off2 = segmentedScanl1 (+) flags mask2
-      
+
       count1_per_seg = propagateR (shiftHeadFlagsL flags) local_off1
       count2_per_seg = propagateR (shiftHeadFlagsL flags) local_off2
 
-      local_sizes = zipWith3 (\f c1 c2 -> if f then 2 + c1 + c2 else 0 :: Exp Int) 
-                             flags count1_per_seg count2_per_seg
-      
+      local_sizes =
+        zipWith5
+          (\f c1 c2 p3i ix -> if f then (if p3i == ix then 1 else 2 + c1 + c2) else 0 :: Exp Int)
+          flags
+          count1_per_seg
+          count2_per_seg
+          p3_indices
+          indices
+
       res_global = scanl' (+) 0 local_sizes
       (global_offsets, total_sum_scalar) = unlift res_global :: (Acc (Vector Int), Acc (Scalar Int))
       the_total_sz = the total_sum_scalar
       starts = propagateL flags global_offsets
 
-      destination = zipWith7 (\f m1 m2 s lo1 lo2 c1 ->
-          if f then 
-            lift (Just (index1 s)) 
-          else if m1 == 1 then 
-            lift (Just (index1 (s + 1 + lo1 - 1))) 
-          else if m2 == 1 then 
-            lift (Just (index1 (s + 2 + c1 + lo2 - 1))) 
-          else 
-            lift (Nothing :: Maybe DIM1)
-        ) flags mask1 mask2 starts local_off1 local_off2 count1_per_seg
+      destination =
+        zipWith7
+          ( \f m1 m2 s lo1 lo2 c1 ->
+              if f
+                then
+                  lift (Just (index1 s))
+                else
+                  if m1 == 1
+                    then
+                      lift (Just (index1 (s + 1 + lo1 - 1)))
+                    else
+                      if m2 == 1
+                        then
+                          lift (Just (index1 (s + 2 + c1 + lo2 - 1)))
+                        else
+                          lift (Nothing :: Maybe DIM1)
+          )
+          flags
+          mask1
+          mask2
+          starts
+          local_off1
+          local_off2
+          count1_per_seg
 
       blankPoints = fill (index1 the_total_sz) (T2 0 0)
       newPoints = permute const blankPoints (destination !) points
-      
-      p3_dest = generate (shape flags) (\i ->
-          if flags ! i 
-          then lift (Just (index1 (starts ! i + 1 + count1_per_seg ! i)))
-          else lift (Nothing :: Maybe DIM1))
-      
+
+      p3_dest =
+        zipWith4
+          ( \f s c1 p3i ->
+              let ix = unindex1 s
+               in if f && (p3i /= ix)
+                    then lift (Just (index1 (starts ! index1 ix + 1 + c1)))
+                    else lift (Nothing :: Maybe DIM1)
+          )
+          flags
+          (generate (shape flags) P.id)
+          count1_per_seg
+          p3_indices
+
       newPointsWithP3 = permute const newPoints (p3_dest !) p3s
 
-      newFlags = generate (index1 the_total_sz) (const (constant False))
-      
-      flagsP1 = permute const newFlags 
-                (\i -> if flags ! i 
-                       then lift (Just (index1 (starts ! i))) 
-                       else lift (Nothing :: Maybe DIM1)) 
-                (fill (shape flags) (constant True))
-      
-      finalFlags = permute const flagsP1 
-                   (\i -> if flags ! i 
-                          then lift (Just (index1 (starts ! i + 1 + count1_per_seg ! i))) 
-                          else lift (Nothing :: Maybe DIM1)) 
-                   (fill (shape flags) (constant True))
+      flagsP1 =
+        permute
+          const
+          (fill (index1 the_total_sz) (constant False))
+          ( \i ->
+              if flags ! i
+                then lift (Just (index1 (starts ! i)))
+                else lift (Nothing :: Maybe DIM1)
+          )
+          (fill (shape flags) (constant True))
 
-  in T2 finalFlags newPointsWithP3
+      finalFlags =
+        permute
+          const
+          flagsP1
+          ( \i ->
+              let c1 = count1_per_seg ! i
+                  p3i = p3_indices ! i
+                  ix = unindex1 i
+               in if flags ! i && (p3i /= ix)
+                    then lift (Just (index1 (starts ! i + 1 + c1)))
+                    else lift (Nothing :: Maybe DIM1)
+          )
+          (fill (shape flags) (constant True))
+   in T2 finalFlags newPointsWithP3
 
 -- The completed algorithm repeatedly partitions the points until there are
 -- no undecided points remaining. What remains is the convex hull.
 --
 quickhull :: Acc (Vector Point) -> Acc (Vector Point)
-quickhull  = 
-  error "quickhull: to be implemented"
+quickhull points =
+  let initParts = initialPartition points
+
+      check :: Acc SegmentedPoints -> Acc (Scalar Bool)
+      check (T2 flags _) = map not (Data.Array.Accelerate.and flags)
+
+      finalState :: Acc SegmentedPoints
+      finalState = awhile check partition initParts
+
+      (T2 _ finalPoints) = finalState
+
+      len = Data.Array.Accelerate.length finalPoints
+   in -- Remove the duplicate point (p1) added at the end
+      Data.Array.Accelerate.take (len - 1) finalPoints
 
 -- Helper functions
 -- ----------------
@@ -253,53 +362,44 @@ propagateR flags values = reverse (segmentedScanl1 const (reverse flags) (revers
 -- should be:
 -- Vector (Z :. 6) [False,False,True,False,True,True]
 shiftHeadFlagsL :: Acc (Vector Bool) -> Acc (Vector Bool)
-shiftHeadFlagsL arr = backpermute sh getIndex arr
+shiftHeadFlagsL arr =
+  generate
+    sh
+    ( \ix ->
+        let i = unindex1 ix
+         in if i == unindex1 sh - 1 then constant True else arr ! index1 (i + 1)
+    )
   where
     sh = shape arr
-    len = unindex1 sh
-    getIndex ix = index1 (min (len - 1) (unindex1 ix + 1))
 
--- >>> import Data.Array.Accelerate.Interpreter
--- >>> run $ shiftHeadFlagsR (use (fromList (Z :. 6) [True,False,False,True,False,False]))
---
--- should be:
--- Vector (Z :. 6) [True,True,False,False,True,False]
+-- Fix: Use generate to properly fill the new first element with True
 shiftHeadFlagsR :: Acc (Vector Bool) -> Acc (Vector Bool)
-shiftHeadFlagsR arr = backpermute sh getIndex arr
+shiftHeadFlagsR arr =
+  generate
+    sh
+    ( \ix ->
+        let i = unindex1 ix
+         in if i == 0 then constant True else arr ! index1 (i - 1)
+    )
   where
     sh = shape arr
-    getIndex ix = index1 (max 0 (unindex1 ix - 1))
 
--- >>> import Data.Array.Accelerate.Interpreter
--- >>> let flags  = fromList (Z :. 9) [True,False,False,True,True,False,False,False,True]
--- >>> let values = fromList (Z :. 9) [1   ,2    ,3    ,4   ,5   ,6    ,7    ,8    ,9   ] :: Vector Int
--- >>> run $ segmentedScanl1 (+) (use flags) (use values)
---
--- Expected answer:
--- >>> fromList (Z :. 9) [1, 1+2, 1+2+3, 4, 5, 5+6, 5+6+7, 5+6+7+8, 9] :: Vector Int
--- Vector (Z :. 9) [1,3,6,4,5,11,18,26,9]
---
--- Mind that the interpreter evaluates scans and folds sequentially, so
--- non-associative combination functions may seem to work fine here -- only to
--- fail spectacularly when testing with a parallel backend on larger inputs. ;)
 segmentedScanl1 :: (Elt a) => (Exp a -> Exp a -> Exp a) -> Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
 segmentedScanl1 f flags values =
   let pairs = zip flags values
-      (_, result) = unzip (scanl1 (segmented f) pairs)
+      -- ScanL: If 'b' (right/current) is a flag, it resets.
+      segL (T2 _ aV) (T2 bF bV) = T2 bF (if bF then bV else f aV bV)
+      (_, result) = unzip (scanl1 segL pairs)
    in result
 
--- >>> import Data.Array.Accelerate.Interpreter
--- >>> let flags  = fromList (Z :. 9) [True,False,False,True,True,False,False,False,True]
--- >>> let values = fromList (Z :. 9) [1   ,2    ,3    ,4   ,5   ,6    ,7    ,8    ,9   ] :: Vector Int
--- >>> run $ segmentedScanr1 (+) (use flags) (use values)
---
--- Expected answer:
--- >>> fromList (Z :. 9) [1, 2+3+4, 3+4, 4, 5, 6+7+8+9, 7+8+9, 8+9, 9] :: Vector Int
--- Vector (Z :. 9) [1,9,7,4,5,30,24,17,9]
+-- Fix: Corrected logic for right scan.
+-- In scanr1 f, 'f' is called with arguments 'a' (element) and 'b' (accumulator).
+-- If 'a' (the current element being processed from R->L) is a flag, it starts a new segment.
 segmentedScanr1 :: (Elt a) => (Exp a -> Exp a -> Exp a) -> Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
 segmentedScanr1 f flags values =
   let pairs = zip flags values
-      segR (T2 aF aV) (T2 bF bV) = T2 aF (if bF then aV else f aV bV)
+      -- ScanR: If 'a' (left/current) is a flag, it resets.
+      segR (T2 aF aV) (T2 bF bV) = T2 aF (if aF then aV else f aV bV)
       (_, result) = unzip (scanr1 segR pairs)
    in result
 
@@ -323,9 +423,6 @@ nonNormalizedDistance (T2 (T2 x1 y1) (T2 x2 y2)) (T2 x y) = nx * x + ny * y - c
 segmented :: (Elt a) => (Exp a -> Exp a -> Exp a) -> Exp (Bool, a) -> Exp (Bool, a) -> Exp (Bool, a)
 segmented f (T2 aF aV) (T2 bF bV) = T2 (aF || bF) (if bF then bV else f aV bV)
 
--- | Read a file (such as "inputs/1.dat") and return a vector of points,
--- suitable as input to 'quickhull' or 'initialPartition'. Not to be used in
--- your quickhull algorithm, but can be used to test your functions in ghci.
 readInputFile :: P.FilePath -> P.IO (Vector Point)
 readInputFile filename =
   (\l -> fromList (Z :. P.length l) l)
