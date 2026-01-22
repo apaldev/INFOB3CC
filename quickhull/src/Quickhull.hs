@@ -26,6 +26,7 @@ where
 import Data.Array.Accelerate
 import Data.Array.Accelerate.Debug.Trace
 import qualified Prelude as P
+import Data.Array.Accelerate.Smart (Acc(Acc))
 
 -- Points and lines in two-dimensional space
 --
@@ -61,33 +62,65 @@ type SegmentedPoints = (Vector Bool, Vector Point)
 --
 initialPartition :: Acc (Vector Point) -> Acc SegmentedPoints
 initialPartition points =
-  let p1, p2 :: Exp Point
-      p1 = error "TODO: locate the left-most point"
-      p2 = error "TODO: locate the right-most point"
+  let 
+      p1, p2 :: Exp Point
+      p1 = the (fold1 (\a b -> let (T2 ax ay) = a
+                                   (T2 bx by) = b
+                               in if ax < bx || (ax == bx && ay <= by) then a else b) points)
+      
+      p2 = the (fold1 (\a b -> let (T2 ax ay) = a
+                                   (T2 bx by) = b
+                               in if ax > bx || (ax == bx && ay >= by) then a else b) points)
+
+      line1 = T2 p1 p2
+      line2 = T2 p2 p1
 
       isUpper :: Acc (Vector Bool)
-      isUpper = error "TODO: determine which points lie above the line (p₁, p₂)"
+      isUpper = map (\p -> pointIsLeftOfLine line1 p && not (pointEq p p1) && not (pointEq p p2)) points
 
       isLower :: Acc (Vector Bool)
-      isLower = error "TODO: determine which points lie below the line (p₁, p₂)"
+      isLower = map (\p -> pointIsLeftOfLine line2 p && not (pointEq p p1) && not (pointEq p p2)) points
 
-      offsetUpper :: Acc (Vector Int)
-      countUpper :: Acc (Scalar Int)
-      T2 offsetUpper countUpper = error "TODO: number of points above the line and their relative index"
+      -- offsetLower :: Acc (Vector Int)
+      -- countLower  :: Acc (Scalar Int)
+      -- T2 offserLower countLower = scanl' (+) 0 (map boolToInt isLower)
+      resUpper = scanl' (+) 0 (map boolToInt isUpper)
+      resLower = scanl' (+) 0 (map boolToInt isLower)
 
-      offsetLower :: Acc (Vector Int)
-      countLower :: Acc (Scalar Int)
-      T2 offsetLower countLower = error "TODO: number of points below the line and their relative index"
-
+      (offsetUpper, countUpper) = unlift resUpper :: (Acc (Vector Int), Acc (Scalar Int))
+      (offsetLower, countLower) = unlift resLower :: (Acc (Vector Int), Acc (Scalar Int))
+      
+      theCountUpper = the countUpper
+      theCountLower = the countLower
+      theSz         = 3 + theCountUpper + theCountLower
+      
       destination :: Acc (Vector (Maybe DIM1))
-      destination = error "TODO: compute the index in the result array for each point (if it is present)"
+      destination = generate (shape points) (\i ->
+          let p = points ! i
+              offU = offsetUpper ! i
+              offL = offsetLower ! i
+          in if pointEq p p1      then lift (Just (index1 0))
+             else if isUpper ! i  then lift (Just (index1 (1 + offU)))
+             else if pointEq p p2 then lift (Just (index1 (1 + theCountUpper)))
+             else if isLower ! i  then lift (Just (index1 (2 + theCountUpper + offL)))
+             else lift (Nothing :: Maybe DIM1)
+        )
 
       newPoints :: Acc (Vector Point)
-      newPoints = error "TODO: place each point into its corresponding segment of the result"
-
+      newPoints = permute const (fill (index1 theSz) p1) (destination !) points
+      
       headFlags :: Acc (Vector Bool)
-      headFlags = error "TODO: create head flags array demarcating the initial segments"
+      headFlags = generate (index1 theSz) (\i -> 
+          let idx = unindex1 i
+          in idx == 0 || idx == (1 + theCountUpper)
+        )
    in T2 headFlags newPoints
+
+pointEq :: Exp Point -> Exp Point -> Exp Bool
+pointEq a b = 
+  let T2 ax ay = a
+      T2 bx by = b
+  in ax == bx && ay == by
 
 -- The core of the algorithm processes all line segments at once in
 -- data-parallel. This is similar to the previous partitioning step, except
@@ -99,15 +132,97 @@ initialPartition points =
 -- These points are undecided.
 --
 partition :: Acc SegmentedPoints -> Acc SegmentedPoints
-partition (T2 headFlags points) =
-  error "TODO: partition"
+partition (T2 flags points) =
+  let 
+      p1_for_each = propagateL flags points
+      p2_for_each = propagateR flags points
+      
+      distances = zipWith3 (\p1 p2 p -> abs (nonNormalizedDistance (T2 p1 p2) p)) 
+                           p1_for_each p2_for_each points
+      
+      indices = generate (shape points) unindex1
+      dist_index = zipWith T2 distances indices
+      
+      argmax_scan = segmentedScanl1 (\v1 v2 -> 
+          let T2 d1 i1 = v1
+              T2 d2 i2 = v2
+          in if d1 > d2 then v1 else v2) flags dist_index
+      
+      argmax_per_segment = propagateR (shiftHeadFlagsL flags) argmax_scan
+      p3_indices = map (\v -> let T2 _ i = v in i) argmax_per_segment
+      p3s        = map (\i -> points ! index1 i) p3_indices
+
+      is_undecided  = map not flags
+      is_left_p1p3  = zipWith3 (\p1 p3 p -> pointIsLeftOfLine (T2 p1 p3) p) p1_for_each p3s points
+      is_left_p3p2  = zipWith3 (\p3 p2 p -> pointIsLeftOfLine (T2 p3 p2) p) p3s p2_for_each points
+      
+      mask1 = zipWith3 (\u l1 l2 -> if u && l1 && not l2 then 1 else 0 :: Exp Int) 
+                       is_undecided is_left_p1p3 is_left_p3p2
+      mask2 = zipWith3 (\u l1 l2 -> if u && not l1 && l2 then 1 else 0 :: Exp Int) 
+                       is_undecided is_left_p1p3 is_left_p3p2
+
+      res_scan1 = scanl' (+) 0 mask1
+      res_scan2 = scanl' (+) 0 mask2
+      (offset1, _) = unlift res_scan1 :: (Acc (Vector Int), Acc (Scalar Int))
+      (offset2, _) = unlift res_scan2 :: (Acc (Vector Int), Acc (Scalar Int))
+      
+      local_off1 = segmentedScanl1 (+) flags mask1
+      local_off2 = segmentedScanl1 (+) flags mask2
+      
+      count1_per_seg = propagateR (shiftHeadFlagsL flags) local_off1
+      count2_per_seg = propagateR (shiftHeadFlagsL flags) local_off2
+
+      local_sizes = zipWith3 (\f c1 c2 -> if f then 2 + c1 + c2 else 0 :: Exp Int) 
+                             flags count1_per_seg count2_per_seg
+      
+      res_global = scanl' (+) 0 local_sizes
+      (global_offsets, total_sum_scalar) = unlift res_global :: (Acc (Vector Int), Acc (Scalar Int))
+      the_total_sz = the total_sum_scalar
+      starts = propagateL flags global_offsets
+
+      destination = zipWith7 (\f m1 m2 s lo1 lo2 c1 ->
+          if f then 
+            lift (Just (index1 s)) 
+          else if m1 == 1 then 
+            lift (Just (index1 (s + 1 + lo1 - 1))) 
+          else if m2 == 1 then 
+            lift (Just (index1 (s + 2 + c1 + lo2 - 1))) 
+          else 
+            lift (Nothing :: Maybe DIM1)
+        ) flags mask1 mask2 starts local_off1 local_off2 count1_per_seg
+
+      blankPoints = fill (index1 the_total_sz) (T2 0 0)
+      newPoints = permute const blankPoints (destination !) points
+      
+      p3_dest = generate (shape flags) (\i ->
+          if flags ! i 
+          then lift (Just (index1 (starts ! i + 1 + count1_per_seg ! i)))
+          else lift (Nothing :: Maybe DIM1))
+      
+      newPointsWithP3 = permute const newPoints (p3_dest !) p3s
+
+      newFlags = generate (index1 the_total_sz) (const (constant False))
+      
+      flagsP1 = permute const newFlags 
+                (\i -> if flags ! i 
+                       then lift (Just (index1 (starts ! i))) 
+                       else lift (Nothing :: Maybe DIM1)) 
+                (fill (shape flags) (constant True))
+      
+      finalFlags = permute const flagsP1 
+                   (\i -> if flags ! i 
+                          then lift (Just (index1 (starts ! i + 1 + count1_per_seg ! i))) 
+                          else lift (Nothing :: Maybe DIM1)) 
+                   (fill (shape flags) (constant True))
+
+  in T2 finalFlags newPointsWithP3
 
 -- The completed algorithm repeatedly partitions the points until there are
 -- no undecided points remaining. What remains is the convex hull.
 --
 quickhull :: Acc (Vector Point) -> Acc (Vector Point)
-quickhull =
-  error "TODO: quickhull"
+quickhull  = 
+  error "quickhull: to be implemented"
 
 -- Helper functions
 -- ----------------
@@ -120,7 +235,7 @@ quickhull =
 -- should be:
 -- Vector (Z :. 9) [1,1,1,4,5,5,5,5,9]
 propagateL :: (Elt a) => Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
-propagateL = error "TODO: propagateL"
+propagateL flags values = segmentedScanl1 const flags values
 
 -- >>> import Data.Array.Accelerate.Interpreter
 -- >>> let flags  = fromList (Z :. 9) [True,False,False,True,True,False,False,False,True]
@@ -130,7 +245,7 @@ propagateL = error "TODO: propagateL"
 -- should be:
 -- Vector (Z :. 9) [1,4,4,4,5,9,9,9,9]
 propagateR :: (Elt a) => Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
-propagateR = error "TODO: propagateR"
+propagateR flags values = reverse (segmentedScanl1 const (reverse flags) (reverse values))
 
 -- >>> import Data.Array.Accelerate.Interpreter
 -- >>> run $ shiftHeadFlagsL (use (fromList (Z :. 6) [False,False,False,True,False,True]))
