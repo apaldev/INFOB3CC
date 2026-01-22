@@ -6,22 +6,17 @@
 {-# LANGUAGE TypeOperators #-}
 
 module Quickhull
-  ( Point,
-    Line,
-    SegmentedPoints,
+  ( Point, Line, SegmentedPoints,
     quickhull,
+
     -- Exported for display
     initialPartition,
     partition,
+
     -- Exported just for testing
-    propagateL,
-    shiftHeadFlagsL,
-    segmentedScanl1,
-    propagateR,
-    shiftHeadFlagsR,
-    segmentedScanr1,
-  )
-where
+    propagateL, shiftHeadFlagsL, segmentedScanl1,
+    propagateR, shiftHeadFlagsR, segmentedScanr1,
+  ) where
 
 import Data.Array.Accelerate
 import Data.Array.Accelerate.Debug.Trace
@@ -31,7 +26,6 @@ import qualified Prelude as P
 -- Points and lines in two-dimensional space
 --
 type Point = (Int, Int)
-
 type Line = (Point, Point)
 
 -- This algorithm will use a head-flags array to distinguish the different
@@ -94,11 +88,13 @@ initialPartition points =
       isLower :: Acc (Vector Bool)
       isLower = map (\p -> pointIsLeftOfLine line2 p && not (pointEq p p1) && not (pointEq p p2)) points
 
-      resUpper = scanl' (+) 0 (map boolToInt isUpper)
-      resLower = scanl' (+) 0 (map boolToInt isLower)
+      offsetUpper :: Acc (Vector Int)
+      countUpper :: Acc (Scalar Int)
+      T2 offsetUpper countUpper = scanl' (+) 0 (map boolToInt isUpper)
 
-      (offsetUpper, countUpper) = unlift resUpper :: (Acc (Vector Int), Acc (Scalar Int))
-      (offsetLower, countLower) = unlift resLower :: (Acc (Vector Int), Acc (Scalar Int))
+      offsetLower :: Acc (Vector Int)
+      countLower :: Acc (Scalar Int)
+      T2 offsetLower countLower = scanl' (+) 0 (map boolToInt isLower)
 
       theCountUpper = the countUpper
       theCountLower = the countLower
@@ -371,8 +367,11 @@ shiftHeadFlagsL arr =
     )
   where
     sh = shape arr
-
--- Fix: Use generate to properly fill the new first element with True
+-- >>> import Data.Array.Accelerate.Interpreter
+-- >>> run $ shiftHeadFlagsR (use (fromList (Z :. 6) [True,False,False,True,False,False]))
+--
+-- should be:
+-- Vector (Z :. 6) [True,True,False,False,True,False]
 shiftHeadFlagsR :: Acc (Vector Bool) -> Acc (Vector Bool)
 shiftHeadFlagsR arr =
   generate
@@ -384,6 +383,18 @@ shiftHeadFlagsR arr =
   where
     sh = shape arr
 
+-- >>> import Data.Array.Accelerate.Interpreter
+-- >>> let flags  = fromList (Z :. 9) [True,False,False,True,True,False,False,False,True]
+-- >>> let values = fromList (Z :. 9) [1   ,2    ,3    ,4   ,5   ,6    ,7    ,8    ,9   ] :: Vector Int
+-- >>> run $ segmentedScanl1 (+) (use flags) (use values)
+--
+-- Expected answer:
+-- >>> fromList (Z :. 9) [1, 1+2, 1+2+3, 4, 5, 5+6, 5+6+7, 5+6+7+8, 9] :: Vector Int
+-- Vector (Z :. 9) [1,3,6,4,5,11,18,26,9]
+--
+-- Mind that the interpreter evaluates scans and folds sequentially, so
+-- non-associative combination functions may seem to work fine here -- only to
+-- fail spectacularly when testing with a parallel backend on larger inputs. ;)
 segmentedScanl1 :: (Elt a) => (Exp a -> Exp a -> Exp a) -> Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
 segmentedScanl1 f flags values =
   let pairs = zip flags values
@@ -392,9 +403,14 @@ segmentedScanl1 f flags values =
       (_, result) = unzip (scanl1 segL pairs)
    in result
 
--- Fix: Corrected logic for right scan.
--- In scanr1 f, 'f' is called with arguments 'a' (element) and 'b' (accumulator).
--- If 'a' (the current element being processed from R->L) is a flag, it starts a new segment.
+-- >>> import Data.Array.Accelerate.Interpreter
+-- >>> let flags  = fromList (Z :. 9) [True,False,False,True,True,False,False,False,True]
+-- >>> let values = fromList (Z :. 9) [1   ,2    ,3    ,4   ,5   ,6    ,7    ,8    ,9   ] :: Vector Int
+-- >>> run $ segmentedScanr1 (+) (use flags) (use values)
+--
+-- Expected answer:
+-- >>> fromList (Z :. 9) [1, 2+3+4, 3+4, 4, 5, 6+7+8+9, 7+8+9, 8+9, 9] :: Vector Int
+-- Vector (Z :. 9) [1,9,7,4,5,30,24,17,9]
 segmentedScanr1 :: (Elt a) => (Exp a -> Exp a -> Exp a) -> Acc (Vector Bool) -> Acc (Vector a) -> Acc (Vector a)
 segmentedScanr1 f flags values =
   let pairs = zip flags values
@@ -423,6 +439,9 @@ nonNormalizedDistance (T2 (T2 x1 y1) (T2 x2 y2)) (T2 x y) = nx * x + ny * y - c
 segmented :: (Elt a) => (Exp a -> Exp a -> Exp a) -> Exp (Bool, a) -> Exp (Bool, a) -> Exp (Bool, a)
 segmented f (T2 aF aV) (T2 bF bV) = T2 (aF || bF) (if bF then bV else f aV bV)
 
+-- | Read a file (such as "inputs/1.dat") and return a vector of points,
+-- suitable as input to 'quickhull' or 'initialPartition'. Not to be used in
+-- your quickhull algorithm, but can be used to test your functions in ghci.
 readInputFile :: P.FilePath -> P.IO (Vector Point)
 readInputFile filename =
   (\l -> fromList (Z :. P.length l) l)
