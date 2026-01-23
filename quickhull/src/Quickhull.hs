@@ -282,7 +282,7 @@ partition (T2 flags points) =
       newPoints = permute const blankPoints (destination !) points
 
       -- determine where to place p3 points
-      p3_dest =
+      p3destination =
         zipWith4
           ( \f s c1 p3i ->
               let ix = unindex1 s
@@ -295,10 +295,10 @@ partition (T2 flags points) =
           count1_per_seg
           p3_indices
 
-      newPointsWithP3 = permute const newPoints (p3_dest !) p3s
+      newPointsWithP3 = permute const newPoints (p3destination !) p3s
 
       -- create new head flags array
-      flagsP1 =
+      flagsNew =
         permute
           const
           (fill (index1 the_total_sz) (constant False))
@@ -313,7 +313,7 @@ partition (T2 flags points) =
       finalFlags =
         permute
           const
-          flagsP1
+          flagsNew
           ( \i ->
               let c1 = count1_per_seg ! i
                   p3i = p3_indices ! i
@@ -331,7 +331,7 @@ partition (T2 flags points) =
 quickhull :: Acc (Vector Point) -> Acc (Vector Point)
 quickhull points =
   let initParts = initialPartition points
-  
+
       -- Check that partitioning should continue while there are undecided points
       check :: Acc SegmentedPoints -> Acc (Scalar Bool)
       check (T2 flags _) = map not (Data.Array.Accelerate.and flags)
@@ -463,4 +463,4 @@ readInputFile filename =
   (\l -> fromList (Z :. P.length l) l)
     P.. P.map (\l -> let ws = P.words l in (P.read (ws P.!! 0), P.read (ws P.!! 1)))
     P.. P.lines
-    P.<$> P.readFile filename
+    P.<$> P.readFile filename 
